@@ -17,42 +17,47 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--input_dir", help="path to folder containing images")
 parser.add_argument("--mode", required=True, choices=["train", "test", "export"])
 parser.add_argument("--output_dir", required=True, help="where to put output files")
-parser.add_argument("--seed", type=int)
+parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--checkpoint", default=None, help="directory with checkpoint to resume training from or use for testing")
 
 parser.add_argument("--max_steps", type=int, help="number of training steps (0 to disable)")
-parser.add_argument("--max_epochs", type=int, help="number of training epochs")
+parser.add_argument("--max_epochs", type=int, default=3, help="number of training epochs")
 parser.add_argument("--summary_freq", type=int, default=100, help="update summaries every summary_freq steps")
 parser.add_argument("--progress_freq", type=int, default=50, help="display progress every progress_freq steps")
 parser.add_argument("--trace_freq", type=int, default=0, help="trace execution every trace_freq steps")
 parser.add_argument("--display_freq", type=int, default=0, help="write current training images every display_freq steps")
-parser.add_argument("--save_freq", type=int, default=5000, help="save model every save_freq steps, 0 to disable")
+parser.add_argument("--save_freq", type=int, default=100000, help="save model every save_freq steps, 0 to disable")
 
-parser.add_argument("--separable_conv", action="store_true", help="use separable convolutions in the generator")
 parser.add_argument("--aspect_ratio", type=float, default=1.0, help="aspect ratio of output images (width/height)")
 parser.add_argument("--lab_colorization", action="store_true", help="split input image into brightness (A) and color (B)")
 parser.add_argument("--batch_size", type=int, default=1, help="number of images in batch")
 parser.add_argument("--which_direction", type=str, default="AtoB", choices=["AtoB", "BtoA"])
 parser.add_argument("--ngf", type=int, default=64, help="number of generator filters in first conv layer")
 parser.add_argument("--ndf", type=int, default=64, help="number of discriminator filters in first conv layer")
-parser.add_argument("--scale_size", type=int, default=286, help="scale images to this size before cropping to 256x256")
+parser.add_argument("--scale_size", type=int, default=266, help="scale images to this size before cropping to 256x256")
 parser.add_argument("--flip", dest="flip", action="store_true", help="flip images horizontally")
 parser.add_argument("--no_flip", dest="flip", action="store_false", help="don't flip images horizontally")
 parser.set_defaults(flip=True)
-parser.add_argument("--lr", type=float, default=0.0002, help="initial learning rate for adam")
+parser.add_argument("--lr", type=float, default=0.00005, help="initial learning rate")
 parser.add_argument("--beta1", type=float, default=0.5, help="momentum term of adam")
-parser.add_argument("--l1_weight", type=float, default=100.0, help="weight on L1 term for generator gradient")
+parser.add_argument("--l1_weight", type=float, default=0.0, help="weight on L1 term for generator gradient")
 parser.add_argument("--gan_weight", type=float, default=1.0, help="weight on GAN term for generator gradient")
-
-# export options
-parser.add_argument("--output_filetype", default="png", choices=["png", "jpeg"])
+parser.add_argument("--skip_connection", type=int, default= 1, help="@luyi: wether to use skip connection")
+parser.add_argument("--patch_gan", type=int, default=1, help="@luyi: wether to use patch gan")
+parser.add_argument("--wgan", type=int, default=1, help="@luyi: wether to use wgan")
 a = parser.parse_args()
 
+if a.wgan:
+    clip = 0.01 #@luyi clip discirminator in wgan
+    n_critic = 5    #@luyi loop discriminator
+else:
+    clip = 1e10
 EPS = 1e-12
 CROP_SIZE = 256
 
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch")
-Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
+Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, dloss_GAN, discrim_grads_and_vars, gloss_GAN, gloss_L1, gen_grads_and_vars,\
+ update_losses, incr_global_step, gen_train, discrim_train, gen_loss, discrim_loss, dloss_WGAN, gloss_WGAN")    #@edited by luyi separate training operators
 
 
 def preprocess(image):
@@ -91,29 +96,15 @@ def augment(image, brightness):
     return rgb
 
 
-def discrim_conv(batch_input, out_channels, stride):
-    padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
-    return tf.layers.conv2d(padded_input, out_channels, kernel_size=4, strides=(stride, stride), padding="valid", kernel_initializer=tf.random_normal_initializer(0, 0.02))
-
-
-def gen_conv(batch_input, out_channels):
-    # [batch, in_height, in_width, in_channels] => [batch, out_height, out_width, out_channels]
-    initializer = tf.random_normal_initializer(0, 0.02)
-    if a.separable_conv:
-        return tf.layers.separable_conv2d(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", depthwise_initializer=initializer, pointwise_initializer=initializer)
-    else:
-        return tf.layers.conv2d(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=initializer)
-
-
-def gen_deconv(batch_input, out_channels):
-    # [batch, in_height, in_width, in_channels] => [batch, out_height, out_width, out_channels]
-    initializer = tf.random_normal_initializer(0, 0.02)
-    if a.separable_conv:
-        _b, h, w, _c = batch_input.shape
-        resized_input = tf.image.resize_images(batch_input, [h * 2, w * 2], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-        return tf.layers.separable_conv2d(resized_input, out_channels, kernel_size=4, strides=(1, 1), padding="same", depthwise_initializer=initializer, pointwise_initializer=initializer)
-    else:
-        return tf.layers.conv2d_transpose(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=initializer)
+def conv(batch_input, out_channels, stride):
+    with tf.variable_scope("conv"):
+        in_channels = batch_input.get_shape()[3]
+        filter = tf.get_variable("filter", [4, 4, in_channels, out_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
+        # [batch, in_height, in_width, in_channels], [filter_width, filter_height, in_channels, out_channels]
+        #     => [batch, out_height, out_width, out_channels]
+        padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
+        conv = tf.nn.conv2d(padded_input, filter, [1, stride, stride, 1], padding="VALID")
+        return conv
 
 
 def lrelu(x, a):
@@ -128,13 +119,35 @@ def lrelu(x, a):
         return (0.5 * (1 + a)) * x + (0.5 * (1 - a)) * tf.abs(x)
 
 
-def batchnorm(inputs):
-    return tf.layers.batch_normalization(inputs, axis=3, epsilon=1e-5, momentum=0.1, training=True, gamma_initializer=tf.random_normal_initializer(1.0, 0.02))
+def batchnorm(input):
+    with tf.variable_scope("batchnorm"):
+        # this block looks like it has 3 inputs on the graph unless we do this
+        input = tf.identity(input)
+
+        channels = input.get_shape()[3]
+        offset = tf.get_variable("offset", [channels], dtype=tf.float32, initializer=tf.zeros_initializer())
+        scale = tf.get_variable("scale", [channels], dtype=tf.float32, initializer=tf.random_normal_initializer(1.0, 0.02))
+        mean, variance = tf.nn.moments(input, axes=[0, 1, 2], keep_dims=False)
+        variance_epsilon = 1e-5
+        normalized = tf.nn.batch_normalization(input, mean, variance, offset, scale, variance_epsilon=variance_epsilon)
+        return normalized
+
+
+def deconv(batch_input, out_channels):
+    with tf.variable_scope("deconv"):
+        batch, in_height, in_width, in_channels = [int(d) for d in batch_input.get_shape()]
+        filter = tf.get_variable("filter", [4, 4, out_channels, in_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
+        # [batch, in_height, in_width, in_channels], [filter_width, filter_height, out_channels, in_channels]
+        #     => [batch, out_height, out_width, out_channels]
+        conv = tf.nn.conv2d_transpose(batch_input, filter, [batch, in_height * 2, in_width * 2, out_channels], [1, 2, 2, 1], padding="SAME")
+        return conv
 
 
 def check_image(image):
     assertion = tf.assert_equal(tf.shape(image)[-1], 3, message="image must have 3 color channels")
-    with tf.control_dependencies([assertion]):
+    assertion2 = tf.assert_less_equal(image, 1, message="image value <= 1")
+    assertion3 = tf.assert_greater_equal(image, -1, message="image value >= -1")
+    with tf.control_dependencies([assertion, assertion2, assertion3]):
         image = tf.identity(image)
 
     if image.get_shape().ndims not in (3, 4):
@@ -279,6 +292,7 @@ def load_examples():
             a_images = preprocess(raw_input[:,:width//2,:])
             b_images = preprocess(raw_input[:,width//2:,:])
 
+
     if a.which_direction == "AtoB":
         inputs, targets = [a_images, b_images]
     elif a.which_direction == "BtoA":
@@ -328,7 +342,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
 
     # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
     with tf.variable_scope("encoder_1"):
-        output = gen_conv(generator_inputs, a.ngf)
+        output = conv(generator_inputs, a.ngf, stride=2)
         layers.append(output)
 
     layer_specs = [
@@ -345,7 +359,7 @@ def create_generator(generator_inputs, generator_outputs_channels):
         with tf.variable_scope("encoder_%d" % (len(layers) + 1)):
             rectified = lrelu(layers[-1], 0.2)
             # [batch, in_height, in_width, in_channels] => [batch, in_height/2, in_width/2, out_channels]
-            convolved = gen_conv(rectified, out_channels)
+            convolved = conv(rectified, out_channels, stride=2)
             output = batchnorm(convolved)
             layers.append(output)
 
@@ -361,18 +375,21 @@ def create_generator(generator_inputs, generator_outputs_channels):
 
     num_encoder_layers = len(layers)
     for decoder_layer, (out_channels, dropout) in enumerate(layer_specs):
-        skip_layer = num_encoder_layers - decoder_layer - 1
-        with tf.variable_scope("decoder_%d" % (skip_layer + 1)):
+        skip_layer = num_encoder_layers - decoder_layer - 1 #skip connection to remove?
+        with tf.variable_scope("decoder_%d" % (num_encoder_layers - decoder_layer)):
             if decoder_layer == 0:
                 # first decoder layer doesn't have skip connections
                 # since it is directly connected to the skip_layer
                 input = layers[-1]
             else:
-                input = tf.concat([layers[-1], layers[skip_layer]], axis=3)
+                if a.skip_connection:
+                    input = tf.concat([layers[-1], layers[skip_layer]], axis=3)
+                else:
+                    input = layers[-1]  #@luyi try to remove skip connection
 
             rectified = tf.nn.relu(input)
             # [batch, in_height, in_width, in_channels] => [batch, in_height*2, in_width*2, out_channels]
-            output = gen_deconv(rectified, out_channels)
+            output = deconv(rectified, out_channels)
             output = batchnorm(output)
 
             if dropout > 0.0:
@@ -382,50 +399,60 @@ def create_generator(generator_inputs, generator_outputs_channels):
 
     # decoder_1: [batch, 128, 128, ngf * 2] => [batch, 256, 256, generator_outputs_channels]
     with tf.variable_scope("decoder_1"):
-        input = tf.concat([layers[-1], layers[0]], axis=3)
+        if a.skip_connection:
+            input = tf.concat([layers[-1], layers[0]], axis=3) #skip connection seems essential for colorization
+        else:
+            input = layers[-1]  #@luyi remove skip connection
         rectified = tf.nn.relu(input)
-        output = gen_deconv(rectified, generator_outputs_channels)
+        output = deconv(rectified, generator_outputs_channels)
         output = tf.tanh(output)
         layers.append(output)
+    return layers[-1]
 
+def create_discriminator(discrim_inputs, discrim_targets):
+    n_layers = 3
+    layers = []
+
+    # 2x [batch, height, width, in_channels] => [batch, height, width, in_channels * 2]
+    input = tf.concat([discrim_inputs, discrim_targets], axis=3)
+
+    # layer_1: [batch, 256, 256, in_channels * 2] => [batch, 128, 128, ndf]
+    with tf.variable_scope("layer_1"):
+        convolved = conv(input, a.ndf, stride=2)
+        rectified = lrelu(convolved, 0.2)
+        layers.append(rectified)
+
+    # layer_2: [batch, 128, 128, ndf] => [batch, 64, 64, ndf * 2]
+    # layer_3: [batch, 64, 64, ndf * 2] => [batch, 32, 32, ndf * 4]
+    # layer_4: [batch, 32, 32, ndf * 4] => [batch, 31, 31, ndf * 8]
+    for i in range(n_layers):
+        with tf.variable_scope("layer_%d" % (len(layers) + 1)):
+            out_channels = a.ndf * min(2**(i+1), 8)
+            stride = 1 if i == n_layers - 1 else 2  # last layer here has stride 1
+            convolved = conv(layers[-1], out_channels, stride=stride)
+            normalized = batchnorm(convolved)
+            rectified = lrelu(normalized, 0.2)
+            layers.append(rectified)
+
+    # layer_5: [batch, 31, 31, ndf * 8] => [batch, 30, 30, 1]
+    with tf.variable_scope("layer_%d" % (len(layers) + 1)):
+        convolved = conv(rectified, out_channels=1, stride=1)
+        if a.patch_gan: #@luyi patch wgan
+            output = convolved
+        else:
+            print("--------PATCH GAN OFF--------")
+            batch_size, poolh, poolw, channel = convolved.get_shape().as_list() #@luyi patch gan removed
+            flat_convolved = tf.reshape(convolved, [batch_size, -1])
+            W = tf.Variable(tf.truncated_normal([poolh*poolw,1], stddev=0.1), name="W")
+            b = tf.Variable(tf.constant(0.1, shape=[1]), name="b")
+            logit = tf.nn.xw_plus_b(flat_convolved, W, b)
+            output = logit  #@luyi wgan
+        layers.append(output)
     return layers[-1]
 
 
 def create_model(inputs, targets):
-    def create_discriminator(discrim_inputs, discrim_targets):
-        n_layers = 3
-        layers = []
-
-        # 2x [batch, height, width, in_channels] => [batch, height, width, in_channels * 2]
-        input = tf.concat([discrim_inputs, discrim_targets], axis=3)
-
-        # layer_1: [batch, 256, 256, in_channels * 2] => [batch, 128, 128, ndf]
-        with tf.variable_scope("layer_1"):
-            convolved = discrim_conv(input, a.ndf, stride=2)
-            rectified = lrelu(convolved, 0.2)
-            layers.append(rectified)
-
-        # layer_2: [batch, 128, 128, ndf] => [batch, 64, 64, ndf * 2]
-        # layer_3: [batch, 64, 64, ndf * 2] => [batch, 32, 32, ndf * 4]
-        # layer_4: [batch, 32, 32, ndf * 4] => [batch, 31, 31, ndf * 8]
-        for i in range(n_layers):
-            with tf.variable_scope("layer_%d" % (len(layers) + 1)):
-                out_channels = a.ndf * min(2**(i+1), 8)
-                stride = 1 if i == n_layers - 1 else 2  # last layer here has stride 1
-                convolved = discrim_conv(layers[-1], out_channels, stride=stride)
-                normalized = batchnorm(convolved)
-                rectified = lrelu(normalized, 0.2)
-                layers.append(rectified)
-
-        # layer_5: [batch, 31, 31, ndf * 8] => [batch, 30, 30, 1]
-        with tf.variable_scope("layer_%d" % (len(layers) + 1)):
-            convolved = discrim_conv(rectified, out_channels=1, stride=1)
-            output = tf.sigmoid(convolved)
-            layers.append(output)
-
-        return layers[-1]
-
-    with tf.variable_scope("generator"):
+    with tf.variable_scope("generator") as scope:
         out_channels = int(targets.get_shape()[-1])
         outputs = create_generator(inputs, out_channels)
 
@@ -445,44 +472,68 @@ def create_model(inputs, targets):
         # minimizing -tf.log will try to get inputs to 1
         # predict_real => 1
         # predict_fake => 0
-        discrim_loss = tf.reduce_mean(-(tf.log(predict_real + EPS) + tf.log(1 - predict_fake + EPS)))
+        dloss_GAN = tf.reduce_mean(-(tf.log(tf.sigmoid(predict_real) + EPS) + tf.log(1 - tf.sigmoid(predict_fake) + EPS)))
+        dloss_WGAN = tf.reduce_mean(predict_fake - predict_real)  #@luyi wgan critic loss
+        discrim_loss = tf.identity(dloss_WGAN) if a.wgan else tf.identity(dloss_GAN)  #discriminator loss either from wgan or gan
 
     with tf.name_scope("generator_loss"):
         # predict_fake => 1
         # abs(targets - outputs) => 0
-        gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))
-        gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
-        gen_loss = gen_loss_GAN * a.gan_weight + gen_loss_L1 * a.l1_weight
+        gloss_GAN = tf.reduce_mean(-tf.log(tf.sigmoid(predict_fake) + EPS))
+        gloss_WGAN = tf.reduce_mean(-predict_fake)    #@luyi wgan generator loss
+        gen_loss = tf.identity(gloss_WGAN) if a.wgan else tf.identity(gloss_GAN)  #@luyi generator loss either from wgan or gan
+        gloss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
 
     with tf.name_scope("discriminator_train"):
         discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("discriminator")]
-        discrim_optim = tf.train.AdamOptimizer(a.lr, a.beta1)
-        discrim_grads_and_vars = discrim_optim.compute_gradients(discrim_loss, var_list=discrim_tvars)
-        discrim_train = discrim_optim.apply_gradients(discrim_grads_and_vars)
+        print('Discriminator Variables:')
+        for var in discrim_tvars:
+            print(var.name)
+        if not a.wgan:
+            discrim_optim = tf.train.AdamOptimizer(a.lr, a.beta1)
+        else:
+            discrim_optim = tf.train.RMSPropOptimizer(a.lr)
+        clipped_var = [tf.assign(var, tf.clip_by_value(var, -clip, clip)) for var in discrim_tvars] #@luyi wgan clip discriminator variables
+        with tf.control_dependencies(clipped_var):  #@luyi clip variables first
+            discrim_grads_and_vars = discrim_optim.compute_gradients(discrim_loss, var_list=discrim_tvars)
+            discrim_train = discrim_optim.apply_gradients(discrim_grads_and_vars)
 
     with tf.name_scope("generator_train"):
-        with tf.control_dependencies([discrim_train]):
-            gen_tvars = [var for var in tf.trainable_variables() if var.name.startswith("generator")]
+        #with tf.control_dependencies([discrim_train]):
+        gen_tvars = [var for var in tf.trainable_variables() if var.name.startswith("generator")]
+        print('Generator Variables:')
+        for var in gen_tvars:
+            print(var.name)
+        if not a.wgan:
             gen_optim = tf.train.AdamOptimizer(a.lr, a.beta1)
-            gen_grads_and_vars = gen_optim.compute_gradients(gen_loss, var_list=gen_tvars)
-            gen_train = gen_optim.apply_gradients(gen_grads_and_vars)
+        else:
+            gen_optim = tf.train.RMSPropOptimizer(a.lr) #@luyi optimizer
+        gen_grads_and_vars = gen_optim.compute_gradients(gen_loss * a.gan_weight + gloss_L1 * a.l1_weight, var_list=gen_tvars)
+        gen_train = gen_optim.apply_gradients(gen_grads_and_vars)
 
     ema = tf.train.ExponentialMovingAverage(decay=0.99)
-    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1])
+    update_losses = ema.apply([dloss_WGAN, gloss_WGAN, dloss_GAN, gloss_GAN, gloss_L1])
 
-    global_step = tf.train.get_or_create_global_step()
+    global_step = tf.contrib.framework.get_or_create_global_step()
     incr_global_step = tf.assign(global_step, global_step+1)
 
     return Model(
         predict_real=predict_real,
         predict_fake=predict_fake,
-        discrim_loss=ema.average(discrim_loss),
+        dloss_GAN=ema.average(dloss_GAN),
+        dloss_WGAN=ema.average(dloss_WGAN),
         discrim_grads_and_vars=discrim_grads_and_vars,
-        gen_loss_GAN=ema.average(gen_loss_GAN),
-        gen_loss_L1=ema.average(gen_loss_L1),
+        gloss_GAN=ema.average(gloss_GAN),
+        gloss_WGAN=ema.average(gloss_WGAN),
+        gloss_L1=ema.average(gloss_L1),
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
-        train=tf.group(update_losses, incr_global_step, gen_train),
+        update_losses=update_losses,
+        gen_train=gen_train,
+        discrim_train=discrim_train,
+        incr_global_step=incr_global_step,
+        gen_loss=gen_loss,
+        discrim_loss=discrim_loss
     )
 
 
@@ -534,6 +585,9 @@ def append_index(filesets, step=False):
 
 
 def main():
+    #if tf.__version__ != "1.0.0":
+    #    raise Exception("Tensorflow version 1.0.0 required")
+
     if a.seed is None:
         a.seed = random.randint(0, 2**31 - 1)
 
@@ -573,26 +627,17 @@ def main():
         input = tf.placeholder(tf.string, shape=[1])
         input_data = tf.decode_base64(input[0])
         input_image = tf.image.decode_png(input_data)
-
         # remove alpha channel if present
-        input_image = tf.cond(tf.equal(tf.shape(input_image)[2], 4), lambda: input_image[:,:,:3], lambda: input_image)
-        # convert grayscale to RGB
-        input_image = tf.cond(tf.equal(tf.shape(input_image)[2], 1), lambda: tf.image.grayscale_to_rgb(input_image), lambda: input_image)
-
+        input_image = input_image[:,:,:3]
         input_image = tf.image.convert_image_dtype(input_image, dtype=tf.float32)
         input_image.set_shape([CROP_SIZE, CROP_SIZE, 3])
         batch_input = tf.expand_dims(input_image, axis=0)
 
-        with tf.variable_scope("generator"):
+        with tf.variable_scope("generator") as scope:
             batch_output = deprocess(create_generator(preprocess(batch_input), 3))
 
-        output_image = tf.image.convert_image_dtype(batch_output, dtype=tf.uint8)[0]
-        if a.output_filetype == "png":
-            output_data = tf.image.encode_png(output_image)
-        elif a.output_filetype == "jpeg":
-            output_data = tf.image.encode_jpeg(output_image, quality=80)
-        else:
-            raise Exception("invalid filetype")
+        output_image = tf.image.convert_image_dtype(batch_output, dtype=tf.uint8, saturate=True)[0]
+        output_data = tf.image.encode_png(output_image)
         output = tf.convert_to_tensor([tf.encode_base64(output_data)])
 
         key = tf.placeholder(tf.string, shape=[1])
@@ -686,15 +731,18 @@ def main():
     with tf.name_scope("outputs_summary"):
         tf.summary.image("outputs", converted_outputs)
 
-    with tf.name_scope("predict_real_summary"):
-        tf.summary.image("predict_real", tf.image.convert_image_dtype(model.predict_real, dtype=tf.uint8))
+    #with tf.name_scope("predict_real_summary"):
+    #    tf.summary.image("predict_real", tf.image.convert_image_dtype(model.predict_real, dtype=tf.uint8))
 
-    with tf.name_scope("predict_fake_summary"):
-        tf.summary.image("predict_fake", tf.image.convert_image_dtype(model.predict_fake, dtype=tf.uint8))
+    #with tf.name_scope("predict_fake_summary"):
+    #    tf.summary.image("predict_fake", tf.image.convert_image_dtype(model.predict_fake, dtype=tf.uint8))
 
-    tf.summary.scalar("discriminator_loss", model.discrim_loss)
-    tf.summary.scalar("generator_loss_GAN", model.gen_loss_GAN)
-    tf.summary.scalar("generator_loss_L1", model.gen_loss_L1)
+    tf.summary.scalar("dloss_GAN", model.dloss_GAN)
+    tf.summary.scalar("gloss_GAN", model.gloss_GAN)
+    tf.summary.scalar("gloss_L1", model.gloss_L1)
+    if a.wgan:
+        tf.summary.scalar("discrim_loss_WGAN", model.dloss_WGAN)
+        tf.summary.scalar("gen_loss_WGAN", model.gloss_WGAN)
 
     for var in tf.trainable_variables():
         tf.summary.histogram(var.op.name + "/values", var)
@@ -726,7 +774,6 @@ def main():
         if a.mode == "test":
             # testing
             # at most, process the test data once
-            start = time.time()
             max_steps = min(examples.steps_per_epoch, max_steps)
             for step in range(max_steps):
                 results = sess.run(display_fetches)
@@ -734,12 +781,11 @@ def main():
                 for i, f in enumerate(filesets):
                     print("evaluated image", f["name"])
                 index_path = append_index(filesets)
+
             print("wrote index at", index_path)
-            print("rate", (time.time() - start) / max_steps)
         else:
             # training
             start = time.time()
-
             for step in range(max_steps):
                 def should(freq):
                     return freq > 0 and ((step + 1) % freq == 0 or step == max_steps - 1)
@@ -751,14 +797,13 @@ def main():
                     run_metadata = tf.RunMetadata()
 
                 fetches = {
-                    "train": model.train,
                     "global_step": sv.global_step,
                 }
 
                 if should(a.progress_freq):
-                    fetches["discrim_loss"] = model.discrim_loss
-                    fetches["gen_loss_GAN"] = model.gen_loss_GAN
-                    fetches["gen_loss_L1"] = model.gen_loss_L1
+                    fetches["dloss_GAN"] = model.dloss_GAN
+                    fetches["gloss_GAN"] = model.gloss_GAN
+                    fetches["gloss_L1"] = model.gloss_L1
 
                 if should(a.summary_freq):
                     fetches["summary"] = sv.summary_op
@@ -766,7 +811,19 @@ def main():
                 if should(a.display_freq):
                     fetches["display"] = display_fetches
 
-                results = sess.run(fetches, options=options, run_metadata=run_metadata)
+                if a.wgan:   #@luyi trainning for wgan
+                    fetches["update_losses"] = model.update_losses
+                    for _ in range(n_critic):
+                        _ = sess.run(model.discrim_train, options=options, run_metadata=run_metadata)
+                    fetches["gen_train"] = model.gen_train
+                    fetches["incr_global_step"] = model.incr_global_step
+                    results = sess.run(fetches, options=options, run_metadata=run_metadata)
+                else:
+                    fetches["update_losses"] = model.update_losses
+                    fetches["gen_train"]=model.gen_train
+                    fetches["discrim_train"]=model.discrim_train
+                    fetches["incr_global_step"]=model.incr_global_step
+                    results = sess.run(fetches, options=options, run_metadata=run_metadata)
 
                 if should(a.summary_freq):
                     print("recording summary")
@@ -788,9 +845,9 @@ def main():
                     rate = (step + 1) * a.batch_size / (time.time() - start)
                     remaining = (max_steps - step) * a.batch_size / rate
                     print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm" % (train_epoch, train_step, rate, remaining / 60))
-                    print("discrim_loss", results["discrim_loss"])
-                    print("gen_loss_GAN", results["gen_loss_GAN"])
-                    print("gen_loss_L1", results["gen_loss_L1"])
+                    print("dloss_GAN", results["dloss_GAN"])
+                    print("gloss_GAN", results["gloss_GAN"])
+                    print("gloss_L1", results["gloss_L1"])
 
                 if should(a.save_freq):
                     print("saving model")
